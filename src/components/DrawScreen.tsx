@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { TEMPLATES } from '../lib/templates'
 import { addFish, loadFish, MAX_FISH } from '../lib/storage'
 import { initAudio, isMuted, playFanfare, setMuted } from '../lib/sound'
+import Icon from './Icon'
 
 const SIZE = 1000
 const COLORS = [
@@ -117,8 +118,20 @@ function exportFishImage(canvas: HTMLCanvasElement): string | null {
 }
 
 interface Props {
-  onDone: () => void
+  /** 保存できたら、新しい魚の id を渡す */
+  onDone: (newFishId: string) => void
   onBack: () => void
+}
+
+const WIDTH_LABELS = ['ほそい', 'ふつう', 'ふとい']
+
+/** 色が明るいかどうか（チェックマークの色を決める） */
+function isLight(hex: string) {
+  const n = parseInt(hex.slice(1), 16)
+  const r = (n >> 16) & 255
+  const g = (n >> 8) & 255
+  const b = n & 255
+  return r * 0.299 + g * 0.587 + b * 0.114 > 160
 }
 
 export default function DrawScreen({ onDone, onBack }: Props) {
@@ -135,12 +148,15 @@ export default function DrawScreen({ onDone, onBack }: Props) {
   const [tmplIdx, setTmplIdx] = useState(0)
   const [toast, setToast] = useState<string | null>(null)
   const [mutedState, setMutedState] = useState(isMuted())
+  const [lifting, setLifting] = useState(false)
 
   const showToast = (msg: string) => {
     setToast(msg)
     window.clearTimeout(toastTimerRef.current)
     toastTimerRef.current = window.setTimeout(() => setToast(null), 2600)
   }
+
+  useEffect(() => () => window.clearTimeout(toastTimerRef.current), [])
 
   // 枠線テンプレートを下のレイヤーに描く
   useEffect(() => {
@@ -149,12 +165,13 @@ export default function DrawScreen({ onDone, onBack }: Props) {
     const ctx = canvas.getContext('2d')!
     ctx.clearRect(0, 0, SIZE, SIZE)
     const path = new Path2D(TEMPLATES[tmplIdx].path)
-    ctx.fillStyle = 'rgba(160, 220, 255, 0.20)'
+    ctx.fillStyle = 'rgba(0, 99, 155, 0.07)'
     ctx.fill(path)
-    ctx.strokeStyle = 'rgba(38, 110, 170, 0.6)'
+    ctx.strokeStyle = 'rgba(0, 99, 155, 0.45)'
     ctx.lineWidth = 15
     ctx.setLineDash([30, 22])
     ctx.lineJoin = 'round'
+    ctx.lineCap = 'round'
     ctx.stroke(path)
     ctx.setLineDash([])
   }, [tmplIdx])
@@ -176,6 +193,7 @@ export default function DrawScreen({ onDone, onBack }: Props) {
     const ctx = canvas.getContext('2d')!
     const img = new Image()
     img.onload = () => {
+      ctx.globalCompositeOperation = 'source-over'
       ctx.clearRect(0, 0, SIZE, SIZE)
       ctx.drawImage(img, 0, 0)
     }
@@ -209,12 +227,13 @@ export default function DrawScreen({ onDone, onBack }: Props) {
   const onPointerDown = (e: React.PointerEvent) => {
     initAudio()
     const canvas = drawRef.current
-    if (!canvas) return
+    if (!canvas || lifting) return
     ;(e.target as Element).setPointerCapture(e.pointerId)
     const pos = getPos(e)
     const ctx = canvas.getContext('2d')!
     if (tool === 'fill') {
       pushHistory()
+      ctx.globalCompositeOperation = 'source-over'
       floodFill(ctx, pos.x, pos.y, color)
       return
     }
@@ -248,7 +267,7 @@ export default function DrawScreen({ onDone, onBack }: Props) {
 
   const handleDone = () => {
     const canvas = drawRef.current
-    if (!canvas) return
+    if (!canvas || lifting) return
     const dataUrl = exportFishImage(canvas)
     if (!dataUrl) {
       showToast('なにか かいてね！')
@@ -264,7 +283,10 @@ export default function DrawScreen({ onDone, onBack }: Props) {
       return
     }
     playFanfare()
-    onDone()
+    // 絵がふわっと持ち上がってから水槽へ
+    setLifting(true)
+    const newId = next[next.length - 1].id
+    window.setTimeout(() => onDone(newId), 480)
   }
 
   const toggleMute = () => {
@@ -274,108 +296,142 @@ export default function DrawScreen({ onDone, onBack }: Props) {
   }
 
   return (
-    <div className="draw-screen">
-      <div className="draw-top">
-        <button className="btn btn-water btn-mid" onClick={onBack}>
-          ← すいそう
+    <div className="screen draw-screen">
+      <div className="draw-topbar">
+        <button className="m3-icon-btn tonal" onClick={onBack} aria-label="すいそうに もどる">
+          <Icon name="arrow_back" />
         </button>
-        <button className="btn icon-btn" onClick={toggleMute} aria-label="おと オン・オフ">
-          {mutedState ? '🔇' : '🔊'}
+        <div className="m3-connected" role="radiogroup" aria-label="さかなの かたち">
+          {TEMPLATES.map((t, i) => (
+            <button
+              key={t.id}
+              role="radio"
+              aria-checked={i === tmplIdx}
+              aria-label={t.name}
+              className={`m3-seg-btn${i === tmplIdx ? ' selected' : ''}`}
+              onClick={() => setTmplIdx(i)}
+            >
+              <svg className="template-icon" viewBox="40 180 950 640" aria-hidden>
+                <path
+                  d={t.path}
+                  fill="currentColor"
+                  fillOpacity={0.18}
+                  stroke="currentColor"
+                  strokeWidth={46}
+                  strokeDasharray="80 50"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </button>
+          ))}
+        </div>
+        <button
+          className={`m3-icon-btn tonal${mutedState ? ' toggle-off' : ''}`}
+          onClick={toggleMute}
+          aria-label="おと オン・オフ"
+          aria-pressed={!mutedState}
+        >
+          <Icon name={mutedState ? 'volume_off' : 'volume_up'} />
         </button>
       </div>
 
-      <div className="template-row">
-        {TEMPLATES.map((t, i) => (
-          <button
-            key={t.id}
-            className={`template-btn${i === tmplIdx ? ' selected' : ''}`}
-            onClick={() => setTmplIdx(i)}
-          >
-            <svg viewBox="0 0 1000 1000" aria-hidden>
-              <path
-                d={t.path}
-                fill="rgba(120,200,255,0.25)"
-                stroke="#5b8db8"
-                strokeWidth={42}
-                strokeDasharray="72 46"
-                strokeLinejoin="round"
-              />
-            </svg>
-            <span>{t.name}</span>
-          </button>
-        ))}
-      </div>
-
-      <div className="draw-canvas-wrap">
-        <canvas ref={tmplRef} width={SIZE} height={SIZE} />
-        <canvas
-          ref={drawRef}
-          width={SIZE}
-          height={SIZE}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={endStroke}
-          onPointerCancel={endStroke}
-          onContextMenu={(e) => e.preventDefault()}
-        />
-      </div>
-
-      <div className="palette-row">
-        {COLORS.map((c) => (
-          <button
-            key={c}
-            className={`swatch${tool !== 'eraser' && color === c ? ' selected' : ''}`}
-            style={{ background: c }}
-            onClick={() => {
-              setColor(c)
-              if (tool === 'eraser') setTool('pen')
-            }}
-            aria-label={`いろ ${c}`}
+      <div className="draw-canvas-area">
+        <div className={`draw-canvas-wrap${lifting ? ' lifting' : ''}`}>
+          <canvas ref={tmplRef} width={SIZE} height={SIZE} />
+          <canvas
+            ref={drawRef}
+            width={SIZE}
+            height={SIZE}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={endStroke}
+            onPointerCancel={endStroke}
+            onContextMenu={(e) => e.preventDefault()}
           />
-        ))}
+        </div>
       </div>
 
-      <div className="tool-row">
+      <div className="palette" role="radiogroup" aria-label="いろ">
+        {COLORS.map((c) => {
+          const selected = tool !== 'eraser' && color === c
+          return (
+            <button
+              key={c}
+              role="radio"
+              aria-checked={selected}
+              className={`swatch${selected ? ' selected' : ''}`}
+              style={{ background: c, color: isLight(c) ? '#181c20' : '#ffffff' }}
+              onClick={() => {
+                setColor(c)
+                if (tool === 'eraser') setTool('pen')
+              }}
+              aria-label={`いろ ${c}`}
+            >
+              {selected && <Icon name="check" size={22} />}
+            </button>
+          )
+        })}
+      </div>
+
+      <div className="m3-connected" role="radiogroup" aria-label="どうぐ">
         {WIDTHS.map((w, i) => (
           <button
             key={w}
-            className={`btn btn-tool btn-mid width-btn${tool === 'pen' && widthIdx === i ? ' selected' : ''}`}
+            role="radio"
+            aria-checked={tool === 'pen' && widthIdx === i}
+            className={`m3-seg-btn${tool === 'pen' && widthIdx === i ? ' selected' : ''}`}
             onClick={() => {
               setTool('pen')
               setWidthIdx(i)
             }}
-            aria-label={`ペンの ふとさ ${i + 1}`}
           >
-            <span className="width-dot" style={{ width: 6 + i * 7, height: 6 + i * 7 }} />
+            <span className="width-dot-box">
+              <span
+                className="width-dot"
+                style={{ width: 6 + i * 7, height: 6 + i * 7 }}
+              />
+            </span>
+            {WIDTH_LABELS[i]}
           </button>
         ))}
         <button
-          className={`btn btn-tool btn-mid${tool === 'eraser' ? ' selected' : ''}`}
+          role="radio"
+          aria-checked={tool === 'eraser'}
+          className={`m3-seg-btn${tool === 'eraser' ? ' selected' : ''}`}
           onClick={() => setTool('eraser')}
         >
-          🧽 けしゴム
+          <Icon name="eraser" />
+          けしゴム
         </button>
         <button
-          className={`btn btn-tool btn-mid${tool === 'fill' ? ' selected' : ''}`}
+          role="radio"
+          aria-checked={tool === 'fill'}
+          className={`m3-seg-btn${tool === 'fill' ? ' selected' : ''}`}
           onClick={() => setTool('fill')}
         >
-          🪣 バケツ
+          <Icon name="fill" />
+          バケツ
         </button>
       </div>
 
       <div className="draw-actions">
-        <button className="btn btn-water btn-mid" onClick={undo}>
-          ↩️ もどる
+        <button className="m3-icon-btn tonal" onClick={undo} aria-label="ひとつ もどる">
+          <Icon name="undo" size={28} />
         </button>
-        <button className="btn btn-water btn-mid" onClick={clearAll}>
-          🗑 ぜんぶけす
+        <button className="m3-icon-btn tonal" onClick={clearAll} aria-label="ぜんぶ けす">
+          <Icon name="delete" size={28} />
         </button>
-        <button className="btn btn-primary btn-big" onClick={handleDone}>
-          できた！🐠
+        <button className="m3-fab tertiary" onClick={handleDone}>
+          <Icon name="check" size={30} />
+          できた！
         </button>
       </div>
 
-      {toast && <div className="toast">{toast}</div>}
+      {toast && (
+        <div className="m3-snackbar draw-snackbar" role="status">
+          <span className="msg">{toast}</span>
+        </div>
+      )}
     </div>
   )
 }

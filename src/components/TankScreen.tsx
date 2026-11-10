@@ -1,20 +1,51 @@
 import { useEffect, useRef, useState } from 'react'
 import { loadFish, saveFishList, type FishRecord } from '../lib/storage'
-import { initAudio, isMuted, playBubble, playEat, playSprinkle, setMuted } from '../lib/sound'
+import {
+  initAudio,
+  isMuted,
+  playBubble,
+  playEat,
+  playSplash,
+  playSprinkle,
+  playWelcome,
+  setMuted,
+} from '../lib/sound'
+import {
+  blitLayer,
+  buildScene,
+  clamp,
+  contourY,
+  drawBackPlants,
+  drawCaustics,
+  drawMidPlants,
+  drawParticles,
+  drawRays,
+  drawSurface,
+  type Ripple,
+  type Scene,
+} from '../tank/scene'
 import FishListModal from './FishListModal'
+import Icon from './Icon'
 
 const MAX_PELLETS = 60
 const SLICES = 26
+/** 1つの餌を追いかけてこの秒数たっても食べられなければ、いったんあきらめる */
+const CHASE_GIVE_UP_SEC = 7
+
+type FishMode = 'swim' | 'bag' | 'free'
 
 interface FishEntity {
   id: string
   img: HTMLImageElement
   ready: boolean
+  mode: FishMode
   x: number
   y: number
   vx: number
   vy: number
   face: 1 | -1
+  /** 見た目の向き（-1〜1 をなめらかに動かして、くるっと振り向かせる） */
+  faceAnim: number
   targetX: number
   targetY: number
   wanderWait: number
@@ -23,14 +54,21 @@ interface FishEntity {
   swimPhase: number
   speedMul: number
   bobY: number
+  chase: Pellet | null
+  chaseTime: number
+  giveUp: Pellet | null
+  giveUpUntil: number
+  chomp: number
+  enterT: number
 }
 
 interface Pellet {
   x: number
   y: number
+  vy: number
   sinkSpeed: number
   swayPhase: number
-  state: 'falling' | 'resting'
+  state: 'air' | 'falling' | 'resting'
   restTime: number
   delay: number
   alpha: number
@@ -42,113 +80,133 @@ interface Bubble {
   r: number
   speed: number
   wobblePhase: number
+  back: boolean
 }
 
-interface Plant {
-  xFrac: number
-  heightFrac: number
-  phase: number
-  blades: number
+interface Drop {
+  x: number
+  y: number
+  vx: number
+  vy: number
+  r: number
 }
 
-const PLANTS: Plant[] = [
-  { xFrac: 0.07, heightFrac: 0.34, phase: 0.4, blades: 3 },
-  { xFrac: 0.2, heightFrac: 0.24, phase: 2.1, blades: 2 },
-  { xFrac: 0.8, heightFrac: 0.28, phase: 1.2, blades: 3 },
-  { xFrac: 0.93, heightFrac: 0.38, phase: 3.4, blades: 2 },
-]
+type BagPhase = 'wait' | 'drop' | 'float' | 'pour' | 'lift'
 
-function clamp(v: number, lo: number, hi: number) {
-  return Math.max(lo, Math.min(hi, v))
-}
-
-/** 背景（水・砂利・岩）をオフスクリーンに描く */
-function buildDecor(w: number, h: number): HTMLCanvasElement {
-  const c = document.createElement('canvas')
-  c.width = Math.max(1, Math.round(w))
-  c.height = Math.max(1, Math.round(h))
-  const ctx = c.getContext('2d')!
-  // 水のグラデーション
-  const grad = ctx.createLinearGradient(0, 0, 0, h)
-  grad.addColorStop(0, '#5ec2f2')
-  grad.addColorStop(0.55, '#2b93d8')
-  grad.addColorStop(1, '#1668ab')
-  ctx.fillStyle = grad
-  ctx.fillRect(0, 0, w, h)
-  // 光の筋
-  ctx.save()
-  ctx.globalAlpha = 0.07
-  ctx.fillStyle = '#ffffff'
-  for (let i = 0; i < 3; i++) {
-    const x = w * (0.18 + i * 0.3)
-    ctx.beginPath()
-    ctx.moveTo(x, 0)
-    ctx.lineTo(x + w * 0.09, 0)
-    ctx.lineTo(x + w * 0.02, h * 0.75)
-    ctx.lineTo(x - w * 0.07, h * 0.75)
-    ctx.closePath()
-    ctx.fill()
-  }
-  ctx.restore()
-  // 砂利
-  const gravelH = h * 0.1
-  ctx.fillStyle = '#c9ae7e'
-  ctx.fillRect(0, h - gravelH, w, gravelH)
-  let seed = 1234567
-  const rand = () => {
-    seed = (seed * 1103515245 + 12345) % 2147483648
-    return seed / 2147483648
-  }
-  const pebbleColors = ['#b89b6c', '#a5875a', '#dcc491', '#97835f', '#e6d3a3']
-  for (let i = 0; i < Math.floor(w / 3); i++) {
-    const px = rand() * w
-    const py = h - gravelH + rand() * gravelH
-    const pr = 2.5 + rand() * 5
-    ctx.fillStyle = pebbleColors[Math.floor(rand() * pebbleColors.length)]
-    ctx.beginPath()
-    ctx.ellipse(px, py, pr, pr * 0.62, rand() * 0.6, 0, Math.PI * 2)
-    ctx.fill()
-  }
-  // 岩
-  const drawRock = (cx: number, cy: number, rw: number, rh: number, tone: string) => {
-    ctx.fillStyle = tone
-    ctx.beginPath()
-    ctx.ellipse(cx, cy, rw, rh, 0, Math.PI, Math.PI * 2)
-    ctx.quadraticCurveTo(cx + rw * 0.9, cy + rh * 0.4, cx + rw * 0.6, cy + rh * 0.55)
-    ctx.lineTo(cx - rw * 0.6, cy + rh * 0.55)
-    ctx.quadraticCurveTo(cx - rw * 0.9, cy + rh * 0.4, cx - rw, cy)
-    ctx.fill()
-    ctx.fillStyle = 'rgba(255,255,255,0.13)'
-    ctx.beginPath()
-    ctx.ellipse(cx - rw * 0.3, cy - rh * 0.35, rw * 0.42, rh * 0.3, -0.3, 0, Math.PI * 2)
-    ctx.fill()
-  }
-  drawRock(w * 0.14, h - gravelH * 0.55, w * 0.13, h * 0.075, '#7d8a96')
-  drawRock(w * 0.2, h - gravelH * 0.4, w * 0.09, h * 0.05, '#8d9aa5')
-  drawRock(w * 0.88, h - gravelH * 0.5, w * 0.11, h * 0.065, '#75828d')
-  return c
+interface Bag {
+  fishId: string
+  phase: BagPhase
+  t: number
+  x: number
+  y: number
+  vy: number
+  angle: number
+  alpha: number
+  splashed: boolean
+  released: boolean
+  tapRequested: boolean
+  dir: 1 | -1
 }
 
 interface Props {
   onDraw: () => void
+  /** 描いたばかりの魚の id。あれば袋から放流する演出をする */
+  releaseId?: string | null
+  onReleaseDone?: () => void
 }
 
-export default function TankScreen({ onDraw }: Props) {
+type ReleaseUi = null | 'arrive' | 'welcome'
+
+function fishAspect(ent: FishEntity) {
+  return ent.ready && ent.img.naturalWidth > 0 ? ent.img.naturalHeight / ent.img.naturalWidth : 0.6
+}
+
+/** 魚の絵を、尾ほど大きく波打たせて描く */
+function drawFishImage(
+  ctx: CanvasRenderingContext2D,
+  ent: FishEntity,
+  x: number,
+  y: number,
+  dispW: number,
+  energy: number,
+  tilt: number,
+) {
+  const img = ent.img
+  const dispH = dispW * fishAspect(ent)
+  const chompScale = ent.chomp > 0 ? 1 + Math.sin((ent.chomp / 0.3) * Math.PI) * 0.06 : 1
+  let fx = ent.faceAnim
+  if (Math.abs(fx) < 0.12) fx = fx < 0 ? -0.12 : 0.12
+  ctx.save()
+  ctx.translate(x, y)
+  ctx.rotate(tilt)
+  ctx.scale(-fx * chompScale, chompScale)
+  const srcW = img.naturalWidth
+  const srcH = img.naturalHeight
+  const sliceSrcW = srcW / SLICES
+  const sliceDstW = dispW / SLICES
+  for (let i = 0; i < SLICES; i++) {
+    const u = i / (SLICES - 1)
+    const amp = (1.5 + 13 * Math.pow(u, 1.6)) * energy * (dispW / 120)
+    const offY = Math.sin(ent.swimPhase - u * 5.2) * Math.min(amp, 13 * energy)
+    ctx.drawImage(
+      img,
+      i * sliceSrcW,
+      0,
+      sliceSrcW + 0.6,
+      srcH,
+      -dispW / 2 + i * sliceDstW,
+      -dispH / 2 + offY,
+      sliceDstW + 0.8,
+      dispH,
+    )
+  }
+  ctx.restore()
+}
+
+/** 運搬用のビニール袋（local 座標：原点は袋の中心） */
+function bagPath(ctx: CanvasRenderingContext2D, W: number, H: number) {
+  const top = -H / 2
+  const nw = W * 0.1
+  ctx.beginPath()
+  ctx.moveTo(-nw, top + H * 0.1)
+  ctx.bezierCurveTo(-W * 0.52, top + H * 0.28, -W * 0.56, H * 0.32, -W * 0.32, H * 0.47)
+  ctx.quadraticCurveTo(0, H * 0.58, W * 0.32, H * 0.47)
+  ctx.bezierCurveTo(W * 0.56, H * 0.32, W * 0.52, top + H * 0.28, nw, top + H * 0.1)
+  ctx.closePath()
+}
+
+export default function TankScreen({ onDraw, releaseId = null, onReleaseDone }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const entitiesRef = useRef<Map<string, FishEntity>>(new Map())
   const pelletsRef = useRef<Pellet[]>([])
   const bubblesRef = useRef<Bubble[]>([])
-  const decorRef = useRef<HTMLCanvasElement | null>(null)
-  const sizeRef = useRef({ w: 0, h: 0 })
+  const dropsRef = useRef<Drop[]>([])
+  const ripplesRef = useRef<Ripple[]>([])
+  const sceneRef = useRef<Scene | null>(null)
+  const bagRef = useRef<Bag | null>(null)
   const bubbleTimerRef = useRef(0)
   const bubbleSoundAtRef = useRef(0)
   const undoTimerRef = useRef<number | undefined>(undefined)
+  const welcomeTimerRef = useRef<number | undefined>(undefined)
+  const releaseDoneRef = useRef(onReleaseDone)
+  releaseDoneRef.current = onReleaseDone
+  const releaseIdRef = useRef(releaseId)
 
   const [fishRecords, setFishRecords] = useState<FishRecord[]>(() => loadFish())
   const [showList, setShowList] = useState(false)
   const [lastDeleted, setLastDeleted] = useState<{ record: FishRecord; index: number } | null>(null)
   const [mutedState, setMutedState] = useState(isMuted())
+  const [releaseUi, setReleaseUi] = useState<ReleaseUi>(null)
+  const setReleaseUiRef = useRef(setReleaseUi)
+
+  useEffect(
+    () => () => {
+      window.clearTimeout(undoTimerRef.current)
+      window.clearTimeout(welcomeTimerRef.current)
+    },
+    [],
+  )
 
   // 魚レコードと泳ぎエンティティの同期
   useEffect(() => {
@@ -157,32 +215,60 @@ export default function TankScreen({ onDraw }: Props) {
     for (const key of [...map.keys()]) {
       if (!ids.has(key)) map.delete(key)
     }
+    if (bagRef.current && !ids.has(bagRef.current.fishId)) bagRef.current = null
     for (const rec of fishRecords) {
-      if (!map.has(rec.id)) {
-        const img = new Image()
-        const ent: FishEntity = {
-          id: rec.id,
-          img,
-          ready: false,
-          x: -1,
-          y: -1,
-          vx: 0,
+      if (map.has(rec.id)) continue
+      const img = new Image()
+      const releasing = releaseIdRef.current === rec.id
+      const ent: FishEntity = {
+        id: rec.id,
+        img,
+        ready: false,
+        mode: releasing ? 'bag' : 'swim',
+        x: -1,
+        y: -1,
+        vx: 0,
+        vy: 0,
+        face: releasing ? 1 : Math.random() < 0.5 ? 1 : -1,
+        faceAnim: 1,
+        targetX: 0,
+        targetY: 0,
+        wanderWait: 0,
+        widthFrac: 0.28 + Math.random() * 0.08,
+        phase: Math.random() * Math.PI * 2,
+        swimPhase: Math.random() * 10,
+        speedMul: 0.85 + Math.random() * 0.35,
+        bobY: 0,
+        chase: null,
+        chaseTime: 0,
+        giveUp: null,
+        giveUpUntil: 0,
+        chomp: 0,
+        enterT: 0,
+      }
+      ent.faceAnim = ent.face
+      img.onload = () => {
+        ent.ready = true
+      }
+      img.src = rec.dataUrl
+      map.set(rec.id, ent)
+      if (releasing) {
+        releaseIdRef.current = null
+        bagRef.current = {
+          fishId: rec.id,
+          phase: 'wait',
+          t: 0,
+          x: 0,
+          y: 0,
           vy: 0,
-          face: Math.random() < 0.5 ? 1 : -1,
-          targetX: 0,
-          targetY: 0,
-          wanderWait: 0,
-          widthFrac: 0.28 + Math.random() * 0.08,
-          phase: Math.random() * Math.PI * 2,
-          swimPhase: Math.random() * 10,
-          speedMul: 0.85 + Math.random() * 0.35,
-          bobY: 0,
+          angle: 0,
+          alpha: 1,
+          splashed: false,
+          released: false,
+          tapRequested: false,
+          dir: 1,
         }
-        img.onload = () => {
-          ent.ready = true
-        }
-        img.src = rec.dataUrl
-        map.set(rec.id, ent)
+        setReleaseUi('arrive')
       }
     }
   }, [fishRecords])
@@ -195,110 +281,351 @@ export default function TankScreen({ onDraw }: Props) {
     const ctx = canvas.getContext('2d')!
     let raf = 0
     let last = performance.now()
+    let dpr = Math.min(2, window.devicePixelRatio || 1)
 
     const resize = () => {
       const rect = wrap.getBoundingClientRect()
-      const dpr = Math.min(2, window.devicePixelRatio || 1)
+      dpr = Math.min(2, window.devicePixelRatio || 1)
       canvas.width = Math.max(1, Math.round(rect.width * dpr))
       canvas.height = Math.max(1, Math.round(rect.height * dpr))
-      sizeRef.current = { w: rect.width, h: rect.height }
-      const decor = buildDecor(rect.width * dpr, rect.height * dpr)
-      decorRef.current = decor
+      if (rect.width > 0 && rect.height > 0) sceneRef.current = buildScene(rect.width, rect.height, dpr)
     }
     resize()
     const ro = new ResizeObserver(resize)
     ro.observe(wrap)
 
-    const floorY = () => sizeRef.current.h - sizeRef.current.h * 0.055
+    const dispWOf = (ent: FishEntity) => {
+      const s = sceneRef.current!
+      const H = s.L.frontY - s.L.waterY
+      return Math.min(s.L.w * ent.widthFrac, H * 0.5)
+    }
+
+    const addRipple = (x: number, size: number) => {
+      ripplesRef.current.push({ x, age: 0, size })
+      if (ripplesRef.current.length > 16) ripplesRef.current.shift()
+    }
+
+    const splash = (x: number, strength: number) => {
+      const s = sceneRef.current!
+      addRipple(x, strength)
+      addRipple(x, strength * 0.6)
+      const n = Math.round(8 + strength * 10)
+      for (let i = 0; i < n; i++) {
+        const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.9
+        const sp = (120 + Math.random() * 200) * Math.min(1.4, strength)
+        dropsRef.current.push({
+          x: x + (Math.random() - 0.5) * 20,
+          y: s.L.waterY - 1,
+          vx: Math.cos(a) * sp,
+          vy: Math.sin(a) * sp,
+          r: 1.5 + Math.random() * 2.5,
+        })
+      }
+      for (let i = 0; i < 6; i++) {
+        bubblesRef.current.push({
+          x: x + (Math.random() - 0.5) * 30,
+          y: s.L.waterY + 10 + Math.random() * 30,
+          r: 1.5 + Math.random() * 3,
+          speed: 30 + Math.random() * 30,
+          wobblePhase: Math.random() * Math.PI * 2,
+          back: false,
+        })
+      }
+      playSplash(strength)
+    }
 
     const update = (dt: number, time: number) => {
-      const { w, h } = sizeRef.current
-      if (w === 0) return
-      const pellets = pelletsRef.current
+      const s = sceneRef.current
+      if (!s) return
+      const L = s.L
+      const { w } = L
+      const H = L.frontY - L.waterY
 
-      // 餌の更新
-      for (const p of pellets) {
+      // ---- 餌
+      for (const p of pelletsRef.current) {
         if (p.delay > 0) {
           p.delay -= dt
           continue
         }
-        if (p.state === 'falling') {
+        if (p.state === 'air') {
+          p.vy += 900 * dt
+          p.y += p.vy * dt
+          if (p.y >= L.waterY) {
+            p.y = L.waterY
+            p.state = 'falling'
+            addRipple(p.x, 0.3)
+          }
+        } else if (p.state === 'falling') {
           p.y += p.sinkSpeed * dt
           p.x += Math.sin(time * 2.2 + p.swayPhase) * 7 * dt
-          if (p.y >= floorY()) {
-            p.y = floorY()
+          p.x = clamp(p.x, w * 0.08, w * 0.92)
+          if (p.y >= L.restY) {
+            p.y = L.restY
             p.state = 'resting'
           }
         } else {
           p.restTime += dt
-          p.alpha = p.restTime < 3.5 ? 1 : Math.max(0, 1 - (p.restTime - 3.5) / 1.2)
+          p.alpha = p.restTime < 4 ? 1 : Math.max(0, 1 - (p.restTime - 4) / 1.2)
         }
       }
-      pelletsRef.current = pellets.filter((p) => p.alpha > 0)
+      pelletsRef.current = pelletsRef.current.filter((p) => p.alpha > 0)
 
-      // 泡の生成
+      // ---- 泡（エアストーンから）
       bubbleTimerRef.current -= dt
-      if (bubbleTimerRef.current <= 0 && bubblesRef.current.length < 26) {
-        bubbleTimerRef.current = 0.35 + Math.random() * 0.5
-        const plant = PLANTS[Math.floor(Math.random() * PLANTS.length)]
+      if (bubbleTimerRef.current <= 0 && bubblesRef.current.length < 40) {
+        bubbleTimerRef.current = 0.12 + Math.random() * 0.22
         bubblesRef.current.push({
-          x: w * plant.xFrac + (Math.random() - 0.5) * 14,
-          y: h - h * 0.08,
-          r: 2 + Math.random() * 4.5,
-          speed: 26 + Math.random() * 34,
+          x: s.airStoneX + (Math.random() - 0.5) * 6,
+          y: contourY(L, s.airStoneX) + 6,
+          r: 1.6 + Math.random() * 3.6,
+          speed: 40 + Math.random() * 40,
           wobblePhase: Math.random() * Math.PI * 2,
+          back: true,
         })
       }
-      // 泡の更新
       for (const b of bubblesRef.current) {
         b.y -= b.speed * dt
-        b.x += Math.sin(time * 3 + b.wobblePhase) * 9 * dt
+        b.speed = Math.min(b.speed + dt * 18, 110)
+        b.x += Math.sin(time * 3 + b.wobblePhase) * 10 * dt
       }
-      const before = bubblesRef.current.length
-      bubblesRef.current = bubblesRef.current.filter((b) => b.y > b.r + 2)
-      if (bubblesRef.current.length < before && time - bubbleSoundAtRef.current > 1.4) {
-        if (Math.random() < 0.4) {
-          playBubble()
-          bubbleSoundAtRef.current = time
+      let popped = false
+      bubblesRef.current = bubblesRef.current.filter((b) => {
+        if (b.y > L.waterY + b.r) return true
+        popped = true
+        if (Math.random() < 0.25) addRipple(b.x, 0.18)
+        return false
+      })
+      if (popped && time - bubbleSoundAtRef.current > 2.2 && Math.random() < 0.3) {
+        playBubble()
+        bubbleSoundAtRef.current = time
+      }
+
+      // ---- しぶき・波紋
+      for (const d of dropsRef.current) {
+        d.vy += 900 * dt
+        d.x += d.vx * dt
+        d.y += d.vy * dt
+      }
+      dropsRef.current = dropsRef.current.filter((d) => !(d.vy > 0 && d.y > L.waterY))
+      for (const r of ripplesRef.current) r.age += dt
+      ripplesRef.current = ripplesRef.current.filter((r) => r.age < 1.2)
+
+      // ---- 袋（放流演出）
+      const bag = bagRef.current
+      if (bag) {
+        const ent = entitiesRef.current.get(bag.fishId)
+        if (!ent) {
+          bagRef.current = null
+        } else {
+          const dispW = dispWOf(ent)
+          const bagW = dispW * 1.4
+          const bagH = bagW * 1.12
+          const restY = L.waterY + bagH * 0.2
+          bag.t += dt
+          if (bag.phase === 'wait') {
+            bag.x = w * 0.5
+            bag.y = -bagH
+            if (bag.t > 0.45) {
+              bag.phase = 'drop'
+              bag.t = 0
+            }
+          } else if (bag.phase === 'drop' || bag.phase === 'float') {
+            if (!bag.splashed) {
+              bag.vy += 1500 * dt
+              if (bag.y + bagH * 0.45 >= L.waterY) {
+                bag.splashed = true
+                splash(bag.x, 1.1)
+              }
+            } else {
+              // 浮力：ばねで水面にぷかぷか
+              const acc = -120 * (bag.y - restY) - 7 * bag.vy
+              bag.vy += acc * dt
+            }
+            bag.y += bag.vy * dt
+            bag.y = Math.min(bag.y, restY + bagH * 0.35)
+            bag.angle = Math.sin(time * 1.7) * 0.07
+            if (bag.phase === 'drop' && bag.splashed && bag.t > 1.0) {
+              bag.phase = 'float'
+              bag.t = 0
+            }
+            if (bag.phase === 'float') {
+              bag.y += Math.sin(time * 2.3) * 0.12
+              if ((bag.tapRequested && bag.t > 0.3) || bag.t > 6) {
+                bag.phase = 'pour'
+                bag.t = 0
+              }
+            }
+          } else if (bag.phase === 'pour') {
+            const k = clamp(bag.t / 0.55, 0, 1)
+            const ease = 1 - Math.pow(1 - k, 3)
+            bag.angle = bag.dir * ease * 1.25
+            if (!bag.released && bag.t > 0.3) {
+              bag.released = true
+              // 袋の口から、魚が水の中へ
+              const lx = 0
+              const ly = bagH * 0.12
+              ent.x = bag.x + lx * Math.cos(bag.angle) - ly * Math.sin(bag.angle)
+              ent.y = Math.max(L.waterY + 4, bag.y + lx * Math.sin(bag.angle) + ly * Math.cos(bag.angle))
+              ent.vx = bag.dir * 170
+              ent.vy = 90
+              ent.face = bag.dir
+              ent.faceAnim = bag.dir
+              ent.mode = 'free'
+              ent.enterT = 0
+              splash(bag.x + bag.dir * bagW * 0.3, 0.8)
+              for (let i = 0; i < 12; i++) {
+                bubblesRef.current.push({
+                  x: ent.x + (Math.random() - 0.5) * dispW * 0.6,
+                  y: ent.y + (Math.random() - 0.5) * 20,
+                  r: 1.5 + Math.random() * 3.5,
+                  speed: 30 + Math.random() * 40,
+                  wobblePhase: Math.random() * Math.PI * 2,
+                  back: false,
+                })
+              }
+              playWelcome()
+              setReleaseUiRef.current('welcome')
+              window.clearTimeout(welcomeTimerRef.current)
+              welcomeTimerRef.current = window.setTimeout(() => setReleaseUiRef.current(null), 2200)
+            }
+            if (bag.t > 0.75) {
+              bag.phase = 'lift'
+              bag.t = 0
+              bag.vy = -60
+            }
+          } else if (bag.phase === 'lift') {
+            bag.vy -= 900 * dt
+            bag.y += bag.vy * dt
+            bag.angle += bag.dir * dt * 0.8
+            bag.alpha = Math.max(0, 1 - bag.t / 0.6)
+            if (bag.t > 0.6) {
+              bagRef.current = null
+              releaseDoneRef.current?.()
+            }
+          }
         }
       }
 
-      // 魚の更新
-      const activePellets = pelletsRef.current.filter((p) => p.delay <= 0)
-      for (const ent of entitiesRef.current.values()) {
+      // ---- 魚
+      const ents = [...entitiesRef.current.values()]
+      const swimmers = ents.filter((e) => e.mode === 'swim')
+      const avail = pelletsRef.current.filter((p) => p.delay <= 0 && p.state !== 'air')
+
+      // 餌の割り当て：1粒を追うのは1匹だけ（取り合いで止まらないように）。
+      // 近い組み合わせから順に決め、いま追っている餌は少し優先して、毎フレームの乗りかえを防ぐ。
+      const claims = new Map<FishEntity, Pellet>()
+      if (avail.length > 0 && swimmers.length > 0) {
+        const pairs: { d: number; f: FishEntity; p: Pellet }[] = []
+        for (const f of swimmers) {
+          const fw = dispWOf(f)
+          const mx = f.x + f.face * fw * 0.42
+          const my = f.y + f.bobY
+          for (const p of avail) {
+            if (f.giveUp === p && time < f.giveUpUntil) continue
+            let d = Math.hypot(p.x - mx, p.y - my)
+            if (f.chase === p) d *= 0.7
+            pairs.push({ d, f, p })
+          }
+        }
+        pairs.sort((a, b) => a.d - b.d)
+        const taken = new Set<Pellet>()
+        for (const { f, p } of pairs) {
+          if (claims.has(f) || taken.has(p)) continue
+          claims.set(f, p)
+          taken.add(p)
+        }
+      }
+
+      const eaten = new Set<Pellet>()
+      for (const ent of ents) {
+        if (ent.mode === 'bag') {
+          ent.swimPhase += dt * 7
+          continue
+        }
+        const dispW = dispWOf(ent)
+        const dispH = dispW * fishAspect(ent)
         if (ent.x < 0) {
           ent.x = w * (0.25 + Math.random() * 0.5)
-          ent.y = h * (0.25 + Math.random() * 0.4)
+          ent.y = L.waterY + H * (0.2 + Math.random() * 0.45)
           ent.targetX = ent.x
           ent.targetY = ent.y
         }
-        const dispW = w * ent.widthFrac
+        if (ent.chomp > 0) ent.chomp = Math.max(0, ent.chomp - dt)
         const speed = Math.hypot(ent.vx, ent.vy)
         ent.swimPhase += dt * (6 + speed * 0.05)
         ent.bobY = Math.sin(time * 2 + ent.phase) * 4
+        ent.faceAnim += (ent.face - ent.faceAnim) * Math.min(1, dt * 9)
 
-        const mouthX = ent.x + ent.face * dispW * 0.42
-        const mouthY = ent.y + ent.bobY
+        if (ent.mode === 'free') {
+          // 袋から出たばかり：勢いで水中へ入り、だんだん落ち着く
+          ent.enterT += dt
+          ent.swimPhase += dt * 8
+          const prevY = ent.y
+          if (ent.y < L.waterY) ent.vy += 1300 * dt
+          else {
+            const drag = Math.exp(-dt * 2.4)
+            ent.vx *= drag
+            ent.vy *= drag
+          }
+          ent.x += ent.vx * dt
+          ent.y += ent.vy * dt
+          if (prevY < L.waterY && ent.y >= L.waterY) splash(ent.x, 0.6)
+          ent.x = clamp(ent.x, dispW * 0.5, w - dispW * 0.5)
+          ent.y = Math.min(ent.y, L.frontY - dispH * 0.3 - 4)
+          if (ent.enterT > 1.2 && ent.y > L.waterY + dispH * 0.4) {
+            ent.mode = 'swim'
+            ent.wanderWait = 2
+            ent.targetX = clamp(ent.x + ent.face * w * 0.25, dispW * 0.6, w - dispW * 0.6)
+            ent.targetY = L.waterY + H * 0.45
+            // ほかの魚が「だれかな？」と見に来る
+            for (const o of swimmers) {
+              if (o === ent) continue
+              const ow = dispWOf(o)
+              o.targetX = clamp(ent.x + (o.x < ent.x ? -1 : 1) * (dispW + ow) * 0.45, ow * 0.6, w - ow * 0.6)
+              o.targetY = clamp(ent.y + (Math.random() - 0.5) * H * 0.2, L.waterY + H * 0.12, L.frontY - H * 0.15)
+              o.wanderWait = 2.2 + Math.random()
+            }
+          }
+          continue
+        }
 
+        const mouthOff = dispW * 0.42
         let tx: number
         let ty: number
         let maxSpeed: number
-        let chasing: Pellet | null = null
-        if (activePellets.length > 0) {
-          let best = Infinity
-          for (const p of activePellets) {
-            const d = Math.hypot(p.x - mouthX, p.y - mouthY)
-            if (d < best) {
-              best = d
-              chasing = p
-            }
+        let chasing = false
+        let arriveR = 90
+        let minSlow = 0.25
+        const p = claims.get(ent) ?? null
+        if (p !== ent.chase) {
+          ent.chase = p
+          ent.chaseTime = 0
+        }
+        if (p) {
+          chasing = true
+          ent.chaseTime += dt
+          if (ent.chaseTime > CHASE_GIVE_UP_SEC) {
+            // どうしても届かない餌はしばらく無視する（スタック防止の保険）
+            ent.giveUp = p
+            ent.giveUpUntil = time + 4
           }
-          tx = chasing!.x
-          ty = chasing!.y
-          maxSpeed = 155 * ent.speedMul
-          // 食べる判定
-          if (best < Math.max(15, dispW * 0.075)) {
-            pelletsRef.current = pelletsRef.current.filter((p) => p !== chasing)
+          // 振り向きにはヒステリシスをつけ、餌の真上・真下で向きがぱたぱた変わらないようにする
+          const rel = p.x - ent.x
+          if (ent.face === 1 && rel < -dispW * 0.12) ent.face = -1
+          else if (ent.face === -1 && rel > dispW * 0.12) ent.face = 1
+          // 体の中心ではなく「口」を餌に合わせる
+          tx = p.x - ent.face * mouthOff
+          ty = p.y - ent.bobY
+          maxSpeed = 150 * ent.speedMul
+          arriveR = 60
+          minSlow = 0.12
+          const mouthX = ent.x + ent.face * mouthOff
+          const mouthY = ent.y + ent.bobY
+          if (Math.hypot(p.x - mouthX, p.y - mouthY) < Math.max(14, dispW * 0.1)) {
+            eaten.add(p)
+            ent.chase = null
+            ent.chaseTime = 0
+            ent.chomp = 0.3
             playEat()
             for (let i = 0; i < 3; i++) {
               bubblesRef.current.push({
@@ -307,17 +634,39 @@ export default function TankScreen({ onDraw }: Props) {
                 r: 1.6 + Math.random() * 2.6,
                 speed: 34 + Math.random() * 26,
                 wobblePhase: Math.random() * Math.PI * 2,
+                back: false,
               })
             }
-            continue
           }
+        } else if (avail.length > 0) {
+          // 餌はあるけれど、ほかの魚が先に取りに行っている：近くで順番待ち
+          let best: Pellet | null = null
+          let bd = Infinity
+          for (const q of avail) {
+            const d = Math.hypot(q.x - ent.x, q.y - ent.y)
+            if (d < bd) {
+              bd = d
+              best = q
+            }
+          }
+          const keep = dispW * 0.95
+          if (best && bd > keep) {
+            tx = best.x + ((ent.x - best.x) / bd) * keep
+            ty = best.y + ((ent.y - best.y) / bd) * keep
+          } else {
+            tx = ent.x + Math.sin(time * 0.7 + ent.phase) * 10
+            ty = ent.y
+          }
+          maxSpeed = 75 * ent.speedMul
         } else {
           ent.wanderWait -= dt
           const distT = Math.hypot(ent.targetX - ent.x, ent.targetY - ent.y)
           if (ent.wanderWait <= 0 || distT < 12) {
             ent.wanderWait = 1.5 + Math.random() * 3
-            ent.targetX = dispW * 0.55 + Math.random() * (w - dispW * 1.1)
-            ent.targetY = h * 0.14 + Math.random() * h * 0.62
+            const loY = L.waterY + H * 0.1 + dispH * 0.4
+            const hiY = Math.max(loY + 1, L.frontY - H * 0.12 - dispH * 0.3)
+            ent.targetX = dispW * 0.6 + Math.random() * Math.max(1, w - dispW * 1.2)
+            ent.targetY = loY + Math.random() * (hiY - loY)
           }
           tx = ent.targetX
           ty = ent.targetY
@@ -327,144 +676,212 @@ export default function TankScreen({ onDraw }: Props) {
         const dx = tx - ent.x
         const dy = ty - ent.y
         const dist = Math.hypot(dx, dy) || 1
-        const slow = chasing ? 1 : clamp(dist / 90, 0.25, 1)
+        const slow = clamp(dist / arriveR, minSlow, 1)
         const desVx = (dx / dist) * maxSpeed * slow
         const desVy = (dy / dist) * maxSpeed * slow
-        const k = 1 - Math.exp(-dt * 3.2)
+        const k = 1 - Math.exp(-dt * (chasing ? 5 : 3.2))
         ent.vx += (desVx - ent.vx) * k
         ent.vy += (desVy - ent.vy) * k
+
+        // 重なりすぎないように、ゆるく押し合う（餌を追っている魚は対象外）
+        if (!chasing) {
+          for (const o of swimmers) {
+            if (o === ent) continue
+            const ox = ent.x - o.x
+            const oy = (ent.y - o.y) * 1.6
+            const d = Math.hypot(ox, oy)
+            const minD = (dispW + dispWOf(o)) * 0.32
+            if (d > 0.01 && d < minD) {
+              const push = (1 - d / minD) * 260
+              ent.vx += (ox / d) * push * dt
+              ent.vy += (oy / d) * push * dt * 0.6
+            }
+          }
+        }
+
         ent.x += ent.vx * dt
         ent.y += ent.vy * dt
-        // 水槽内に収める
-        const mx = dispW * 0.52
-        const top = h * 0.07
-        const bottom = floorY() - 6
+
+        // 水槽の中に収める（はみ出したら、なめらかに押し戻す）
+        const mx = dispW * 0.5
+        const top = L.waterY + dispH * 0.45
+        const bottom = chasing && p && p.state === 'resting' ? L.frontY - 3 : L.frontY - dispH * 0.3 - 4
+        const ease = Math.min(1, dt * 6)
         if (ent.x < mx) {
-          ent.x = mx
-          ent.vx = Math.abs(ent.vx)
+          ent.x += (mx - ent.x) * ease
+          ent.vx = Math.max(ent.vx, 0)
         }
         if (ent.x > w - mx) {
-          ent.x = w - mx
-          ent.vx = -Math.abs(ent.vx)
+          ent.x += (w - mx - ent.x) * ease
+          ent.vx = Math.min(ent.vx, 0)
         }
+        ent.x = clamp(ent.x, dispW * 0.3, w - dispW * 0.3)
         if (ent.y < top) {
-          ent.y = top
-          ent.vy = Math.abs(ent.vy)
+          ent.y += (top - ent.y) * ease
+          ent.vy = Math.max(ent.vy, 0)
         }
         if (ent.y > bottom) {
-          ent.y = bottom
-          ent.vy = -Math.abs(ent.vy)
+          ent.y += (bottom - ent.y) * ease
+          ent.vy = Math.min(ent.vy, 0)
         }
-        if (ent.vx > 5) ent.face = 1
-        else if (ent.vx < -5) ent.face = -1
+        if (!chasing) {
+          if (ent.vx > 8) ent.face = 1
+          else if (ent.vx < -8) ent.face = -1
+        }
       }
+      if (eaten.size > 0) pelletsRef.current = pelletsRef.current.filter((p) => !eaten.has(p))
     }
 
-    const drawPlant = (plant: Plant, time: number) => {
-      const { w, h } = sizeRef.current
-      const baseX = w * plant.xFrac
-      const baseY = h - h * 0.045
-      const height = h * plant.heightFrac
-      for (let b = 0; b < plant.blades; b++) {
-        const off = (b - (plant.blades - 1) / 2) * 9
-        const sway = Math.sin(time * 1.3 + plant.phase + b * 0.7) * w * 0.02
-        ctx.strokeStyle = b % 2 === 0 ? 'rgba(46, 160, 90, 0.9)' : 'rgba(72, 190, 110, 0.9)'
-        ctx.lineWidth = 7 - b
-        ctx.lineCap = 'round'
-        ctx.beginPath()
-        ctx.moveTo(baseX + off, baseY)
-        ctx.quadraticCurveTo(
-          baseX + off + sway * 0.4,
-          baseY - height * 0.55,
-          baseX + off + sway,
-          baseY - height * (0.85 + (b % 2) * 0.15),
-        )
-        ctx.stroke()
-      }
+    const drawBubble = (b: Bubble) => {
+      ctx.strokeStyle = 'rgba(232,248,255,0.6)'
+      ctx.lineWidth = 1.3
+      ctx.beginPath()
+      ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.fillStyle = 'rgba(255,255,255,0.12)'
+      ctx.fill()
+      ctx.fillStyle = 'rgba(255,255,255,0.85)'
+      ctx.beginPath()
+      ctx.arc(b.x - b.r * 0.3, b.y - b.r * 0.3, b.r * 0.28, 0, Math.PI * 2)
+      ctx.fill()
     }
 
-    const drawFish = (ent: FishEntity) => {
-      if (!ent.ready || ent.x < 0) return
-      const { w } = sizeRef.current
-      const img = ent.img
-      const dispW = w * ent.widthFrac
-      const dispH = dispW * (img.naturalHeight / img.naturalWidth)
+    const drawPellet = (p: Pellet) => {
+      ctx.globalAlpha = p.alpha
+      ctx.fillStyle = '#7a4a1c'
+      ctx.beginPath()
+      ctx.arc(p.x, p.y, 4.2, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.fillStyle = '#b07a3a'
+      ctx.beginPath()
+      ctx.arc(p.x - 1.2, p.y - 1.3, 2, 0, Math.PI * 2)
+      ctx.fill()
+      ctx.globalAlpha = 1
+    }
+
+    const drawSwimFish = (ent: FishEntity) => {
+      if (!ent.ready || ent.x < 0 || ent.mode === 'bag') return
+      const dispW = dispWOf(ent)
       const speed = Math.hypot(ent.vx, ent.vy)
-      const energy = clamp(0.35 + speed / 120, 0.35, 1.35)
+      const energy = clamp(0.35 + speed / 120, 0.35, ent.mode === 'free' ? 1.6 : 1.35)
       const tilt = ent.face * clamp(ent.vy * 0.0032, -0.3, 0.3)
+      drawFishImage(ctx, ent, ent.x, ent.y + ent.bobY, dispW, energy, tilt)
+    }
+
+    const drawBag = (bag: Bag) => {
+      const s = sceneRef.current!
+      const ent = entitiesRef.current.get(bag.fishId)
+      if (!ent || bag.phase === 'wait') return
+      const dispW = dispWOf(ent)
+      const W = dispW * 1.4
+      const Hh = W * 1.12
       ctx.save()
-      ctx.translate(ent.x, ent.y + ent.bobY)
-      ctx.rotate(tilt)
-      ctx.scale(-ent.face, 1)
-      const srcW = img.naturalWidth
-      const srcH = img.naturalHeight
-      const sliceSrcW = srcW / SLICES
-      const sliceDstW = dispW / SLICES
-      for (let i = 0; i < SLICES; i++) {
-        const u = i / (SLICES - 1)
-        const amp = (1.5 + 13 * Math.pow(u, 1.6)) * energy
-        const offY = Math.sin(ent.swimPhase - u * 5.2) * amp
-        ctx.drawImage(
-          img,
-          i * sliceSrcW,
-          0,
-          sliceSrcW + 0.6,
-          srcH,
-          -dispW / 2 + i * sliceDstW,
-          -dispH / 2 + offY,
-          sliceDstW + 0.8,
-          dispH,
-        )
+      ctx.globalAlpha = bag.alpha
+      ctx.translate(bag.x, bag.y)
+      ctx.rotate(bag.angle)
+      // 中の水（水平を保つ）＋ 魚
+      ctx.save()
+      bagPath(ctx, W, Hh)
+      ctx.clip()
+      ctx.rotate(-bag.angle)
+      const lvl = s.L.waterY - bag.y + 2
+      ctx.fillStyle = 'rgba(150,215,240,0.28)'
+      ctx.fillRect(-W * 1.5, -Hh * 1.5, W * 3, Hh * 3)
+      if (!bag.released) {
+        ctx.fillStyle = 'rgba(90,180,225,0.42)'
+        ctx.fillRect(-W * 1.5, Math.min(lvl, -Hh * 0.05), W * 3, Hh * 3)
       }
       ctx.restore()
+      if (!bag.released && ent.ready) {
+        ctx.save()
+        bagPath(ctx, W, Hh)
+        ctx.clip()
+        drawFishImage(ctx, ent, 0, Hh * 0.16 + Math.sin(ent.swimPhase * 0.3) * 2, dispW * 0.9, 0.7, 0)
+        ctx.restore()
+      }
+      // ビニールのつや
+      bagPath(ctx, W, Hh)
+      ctx.fillStyle = 'rgba(255,255,255,0.08)'
+      ctx.fill()
+      ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+      ctx.lineWidth = 2
+      ctx.stroke()
+      ctx.strokeStyle = 'rgba(255,255,255,0.55)'
+      ctx.lineWidth = 3.5
+      ctx.lineCap = 'round'
+      ctx.beginPath()
+      ctx.moveTo(-W * 0.36, -Hh * 0.08)
+      ctx.quadraticCurveTo(-W * 0.42, Hh * 0.18, -W * 0.28, Hh * 0.36)
+      ctx.stroke()
+      // 結び目と輪ゴム（あけたら消える）
+      const top = -Hh / 2
+      if (!bag.released) {
+        ctx.fillStyle = 'rgba(255,255,255,0.55)'
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)'
+        ctx.lineWidth = 1.5
+        ctx.beginPath()
+        ctx.moveTo(-W * 0.1, top + Hh * 0.1)
+        ctx.lineTo(-W * 0.2, top - Hh * 0.08)
+        ctx.quadraticCurveTo(0, top - Hh * 0.02, W * 0.2, top - Hh * 0.08)
+        ctx.lineTo(W * 0.1, top + Hh * 0.1)
+        ctx.closePath()
+        ctx.fill()
+        ctx.stroke()
+        ctx.fillStyle = '#ff8a3d'
+        ctx.beginPath()
+        ctx.roundRect(-W * 0.11, top + Hh * 0.05, W * 0.22, Hh * 0.05, 3)
+        ctx.fill()
+      } else {
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)'
+        ctx.lineWidth = 2
+        ctx.beginPath()
+        ctx.moveTo(-W * 0.1, top + Hh * 0.1)
+        ctx.lineTo(-W * 0.16, top - Hh * 0.02)
+        ctx.moveTo(W * 0.1, top + Hh * 0.1)
+        ctx.lineTo(W * 0.16, top - Hh * 0.02)
+        ctx.stroke()
+      }
+      ctx.restore()
+      // 水に浸かっている部分は水の色を重ねる
+      if (bag.alpha > 0.5) {
+        ctx.save()
+        ctx.translate(bag.x, bag.y)
+        ctx.rotate(bag.angle)
+        bagPath(ctx, W, Hh)
+        ctx.clip()
+        ctx.rotate(-bag.angle)
+        ctx.fillStyle = 'rgba(40,140,190,0.22)'
+        ctx.fillRect(-W * 1.5, s.L.waterY - bag.y, W * 3, Hh * 3)
+        ctx.restore()
+      }
     }
 
     const render = (time: number) => {
-      const { w, h } = sizeRef.current
-      const dpr = Math.min(2, window.devicePixelRatio || 1)
+      const s = sceneRef.current
+      if (!s) return
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-      ctx.clearRect(0, 0, w, h)
-      if (decorRef.current) {
-        ctx.save()
-        ctx.setTransform(1, 0, 0, 1, 0, 0)
-        ctx.drawImage(decorRef.current, 0, 0)
-        ctx.restore()
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-      }
-      for (const plant of PLANTS) drawPlant(plant, time)
-      // 餌
-      for (const p of pelletsRef.current) {
-        if (p.delay > 0) continue
-        ctx.save()
-        ctx.globalAlpha = p.alpha
-        ctx.fillStyle = '#8a5a22'
+      ctx.clearRect(0, 0, s.L.w, s.L.h)
+      blitLayer(ctx, s.back, dpr)
+      drawRays(ctx, s, time)
+      drawBackPlants(ctx, s, time)
+      for (const b of bubblesRef.current) if (b.back) drawBubble(b)
+      blitLayer(ctx, s.hard, dpr)
+      drawCaustics(ctx, s, time)
+      drawMidPlants(ctx, s, time)
+      drawParticles(ctx, s, time)
+      drawSurface(ctx, s, time, ripplesRef.current)
+      for (const p of pelletsRef.current) if (p.delay <= 0 && p.state !== 'resting') drawPellet(p)
+      for (const ent of entitiesRef.current.values()) drawSwimFish(ent)
+      for (const b of bubblesRef.current) if (!b.back) drawBubble(b)
+      blitLayer(ctx, s.front, dpr)
+      for (const p of pelletsRef.current) if (p.state === 'resting') drawPellet(p)
+      ctx.fillStyle = 'rgba(225,245,255,0.9)'
+      for (const d of dropsRef.current) {
         ctx.beginPath()
-        ctx.arc(p.x, p.y, 5, 0, Math.PI * 2)
+        ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2)
         ctx.fill()
-        ctx.fillStyle = '#a9742f'
-        ctx.beginPath()
-        ctx.arc(p.x - 1.5, p.y - 1.5, 2.2, 0, Math.PI * 2)
-        ctx.fill()
-        ctx.restore()
       }
-      // 魚
-      for (const ent of entitiesRef.current.values()) drawFish(ent)
-      // 泡
-      for (const b of bubblesRef.current) {
-        ctx.save()
-        ctx.globalAlpha = 0.55
-        ctx.strokeStyle = '#e8f8ff'
-        ctx.lineWidth = 1.4
-        ctx.beginPath()
-        ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2)
-        ctx.stroke()
-        ctx.globalAlpha = 0.8
-        ctx.fillStyle = '#ffffff'
-        ctx.beginPath()
-        ctx.arc(b.x - b.r * 0.3, b.y - b.r * 0.3, b.r * 0.28, 0, Math.PI * 2)
-        ctx.fill()
-        ctx.restore()
-      }
+      if (bagRef.current) drawBag(bagRef.current)
     }
 
     const loop = (t: number) => {
@@ -475,6 +892,10 @@ export default function TankScreen({ onDraw }: Props) {
       raf = requestAnimationFrame(loop)
     }
     raf = requestAnimationFrame(loop)
+    if (import.meta.env.DEV) {
+      // 動作確認用（開発時のみ）
+      ;(window as unknown as Record<string, unknown>).__tank = { pelletsRef, entitiesRef, bagRef}
+    }
     return () => {
       cancelAnimationFrame(raf)
       ro.disconnect()
@@ -483,24 +904,32 @@ export default function TankScreen({ onDraw }: Props) {
 
   const feed = () => {
     initAudio()
-    const { w } = sizeRef.current
+    const s = sceneRef.current
+    if (!s) return
+    const { w } = s.L
     const pellets = pelletsRef.current
     const room = MAX_PELLETS - pellets.length
-    if (room <= 0 || w === 0) return
+    if (room <= 0) return
     const n = Math.min(room, 5 + Math.floor(Math.random() * 4))
     for (let i = 0; i < n; i++) {
       pellets.push({
-        x: 24 + Math.random() * Math.max(10, w - 48),
-        y: 5,
+        x: w * 0.1 + Math.random() * w * 0.8,
+        y: s.L.lidH + 2 + Math.random() * 6,
+        vy: 0,
         sinkSpeed: 20 + Math.random() * 15,
         swayPhase: Math.random() * Math.PI * 2,
-        state: 'falling',
+        state: 'air',
         restTime: 0,
         delay: i * 0.09,
         alpha: 1,
       })
     }
     playSprinkle()
+  }
+
+  const onStagePointerDown = () => {
+    const bag = bagRef.current
+    if (bag && (bag.phase === 'float' || bag.phase === 'drop')) bag.tapRequested = true
   }
 
   const handleDelete = (record: FishRecord, index: number) => {
@@ -530,40 +959,78 @@ export default function TankScreen({ onDraw }: Props) {
   }
 
   return (
-    <div className="tank-screen">
-      <div className="tank-canvas-wrap" ref={wrapRef}>
-        <canvas ref={canvasRef} />
+    <div className="screen tank-screen">
+      <div className="tank-stage">
+        <div className="tank-canvas-wrap" ref={wrapRef} onPointerDown={onStagePointerDown}>
+          <canvas ref={canvasRef} />
+        </div>
+        <div className="tank-top">
+          <div className="m3-chip" aria-label={`おさかな ${fishRecords.length}ひき`}>
+            <Icon name="fish" size={20} />
+            {fishRecords.length}ひき
+          </div>
+          <button
+            className={`m3-icon-btn on-glass${mutedState ? ' toggle-off' : ''}`}
+            onClick={toggleMute}
+            aria-label="おと オン・オフ"
+            aria-pressed={!mutedState}
+          >
+            <Icon name={mutedState ? 'volume_off' : 'volume_up'} />
+          </button>
+        </div>
+        {releaseUi && (
+          <div className="release-banner" aria-live="polite">
+            {releaseUi === 'arrive' ? (
+              <div className="release-card" key="arrive">
+                <span className="title">あたらしい なかまが きたよ！</span>
+                <span className="sub pulse">タップして すいそうに はなそう</span>
+              </div>
+            ) : (
+              <div className="release-card welcome" key="welcome">
+                <span className="title">ようこそ！ よろしくね</span>
+              </div>
+            )}
+          </div>
+        )}
         {fishRecords.length === 0 && (
           <div className="empty-guide">
-            <div className="guide-text">おさかなを かいてね 🐠</div>
-            <button className="btn btn-primary btn-big" onClick={onDraw}>
-              ✏️ おえかきする
-            </button>
+            <div className="empty-card">
+              <div className="headline">おさかなを かいてね</div>
+              <div className="supporting">かいた おさかなが ここで およぐよ</div>
+              <button className="m3-fab tertiary" onClick={onDraw}>
+                <Icon name="brush" size={28} />
+                おえかきする
+              </button>
+            </div>
           </div>
         )}
         {lastDeleted && (
-          <div className="undo-bar">
-            <span>おさかなを けしたよ</span>
-            <button className="btn btn-primary btn-mid" onClick={undoDelete}>
+          <div className="m3-snackbar" role="status">
+            <span className="msg">おさかなを けしたよ</span>
+            <button className="m3-btn inverse-text size-s" onClick={undoDelete}>
               もどす
             </button>
           </div>
         )}
       </div>
-      <div className="tank-buttons">
-        <button className="btn btn-primary btn-big" onClick={feed}>
-          🍚 えさやり
+      <nav className="m3-docked-toolbar" aria-label="すいそうの ボタン">
+        <button className="m3-toolbar-item" onClick={() => setShowList(true)}>
+          <span className="indicator">
+            <Icon name="collection" />
+          </span>
+          <span className="label">いちらん</span>
         </button>
-        <button className="btn btn-water btn-big" onClick={() => setShowList(true)}>
-          🐠 いちらん
+        <button className="m3-fab primary" onClick={feed}>
+          <Icon name="food" size={30} />
+          えさやり
         </button>
-        <button className="btn btn-water btn-big" onClick={onDraw}>
-          ✏️ おえかき
+        <button className="m3-toolbar-item" onClick={onDraw}>
+          <span className="indicator">
+            <Icon name="brush" />
+          </span>
+          <span className="label">おえかき</span>
         </button>
-        <button className="btn icon-btn" onClick={toggleMute} aria-label="おと オン・オフ">
-          {mutedState ? '🔇' : '🔊'}
-        </button>
-      </div>
+      </nav>
       {showList && (
         <FishListModal fish={fishRecords} onClose={() => setShowList(false)} onDelete={handleDelete} />
       )}

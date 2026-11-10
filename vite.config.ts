@@ -1,1 +1,7 @@
-aW1wb3J0IHsgZGVmaW5lQ29uZmlnIH0gZnJvbSAndml0ZScKaW1wb3J0IHJlYWN0IGZyb20gJ0B2aXRlanMvcGx1Z2luLXJlYWN0JwoKZXhwb3J0IGRlZmF1bHQgZGVmaW5lQ29uZmlnKHsKICBiYXNlOiAnL2NjX2FxdWFyaXVtLycsCiAgcGx1Z2luczogW3JlYWN0KCldLAp9KQo=
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  base: '/cc_aquarium/',
+  plugins: [react()],
+})

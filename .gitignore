@@ -1,1 +1,4 @@
-bm9kZV9tb2R1bGVzCmRpc3QKKi5sb2NhbAouRFNfU3RvcmUK
+node_modules
+dist
+*.local
+.DS_Store
